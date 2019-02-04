@@ -1,6 +1,18 @@
 CSBDeep – a toolbox for CARE
 ============================
 
+.. image:: https://badge.fury.io/py/csbdeep.svg
+   :target: https://pypi.org/project/csbdeep
+   :alt: PyPI version
+
+.. image:: https://travis-ci.com/CSBDeep/CSBDeep.svg?branch=master
+   :target: https://travis-ci.com/CSBDeep/CSBDeep
+   :alt: Linux build status
+
+.. image:: https://ci.appveyor.com/api/projects/status/xbl32vudixshj990/branch/master?svg=true
+   :target: https://ci.appveyor.com/project/UweSchmidt/csbdeep-c2jtk
+   :alt: Windows build status
+
 This is the documentation for the
 `CSBDeep Python package <https://github.com/csbdeep/csbdeep>`_,
 which provides a toolbox for content-aware restoration (CARE)
@@ -20,9 +32,7 @@ on how to use this package.
 .. note::
     This is an early version of the software.
     Several features are still missing, including the use of network
-    ensembles and the application for surface projection.
-    Furthermore, creating training data via simulation is currently
-    not implemented.
+    ensembles and creating training data via simulation.
 
 
 Table of contents
@@ -36,4 +46,4 @@ Table of contents
    prediction
 
 
-**Last updated:** |today|
+.. **Last updated:** |today|

@@ -11,6 +11,7 @@
 
 import sys
 import os
+from datetime import datetime
 
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
@@ -60,7 +61,7 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'CSBDeep'
-copyright = u'2018, CSBD'
+copyright = u'2018–{}, CSBD'.format(datetime.now().year)
 author = u'Uwe Schmidt, Martin Weigert'
 
 # The version info for the project you're documenting, acts as replacement for
@@ -167,11 +168,11 @@ html_theme = 'sphinx_rtd_theme'
 
 # If not '', a 'Last updated on:' timestamp is inserted at every page bottom,
 # using the given strftime format.
-#html_last_updated_fmt = '%b %d, %Y'
+html_last_updated_fmt = '%b %d, %Y'
 
 # If true, SmartyPants will be used to convert quotes and dashes to
 # typographically correct entities.
-#html_use_smartypants = True
+html_use_smartypants = True
 
 # Custom sidebar templates, maps document names to template names.
 #html_sidebars = {}

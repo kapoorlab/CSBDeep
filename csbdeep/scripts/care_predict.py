@@ -8,7 +8,8 @@ import numpy as np
 from tqdm import tqdm
 
 from csbdeep.io import save_tiff_imagej_compatible
-from csbdeep.utils import Path, _raise, axes_check_and_normalize
+from csbdeep.utils import _raise, axes_check_and_normalize
+from csbdeep.utils.six import Path
 
 
 def str2bool(v):
@@ -33,7 +34,7 @@ def parse_args():
     data.add_argument('--norm-pmin',          metavar='', type=float,    required=False,                         default=2,                                                help="'pmin' for PercentileNormalizer")
     data.add_argument('--norm-pmax',          metavar='', type=float,    required=False,                         default=99.8,                                             help="'pmax' for PercentileNormalizer")
     data.add_argument('--norm-undo',          metavar='', type=str2bool, required=False,  const=True, nargs='?', default=True,                                             help="'do_after' for PercentileNormalizer")
-    data.add_argument('--n-tiles',            metavar='', type=int,      required=False,                         default=1,                                                help="number of tiles for prediction")
+    data.add_argument('--n-tiles',            metavar='', type=int,      required=False,              nargs='+', default=None,                                             help="number of tiles for prediction")
 
     model = parser.add_argument_group("model")
     model.add_argument('--model-basedir',     metavar='', type=str,      required=False,                         default=None,                                             help="path to folder that contains CARE model")
@@ -111,10 +112,14 @@ def main():
         model.load_weights(args.model_weights)
     normalizer = PercentileNormalizer(pmin=args.norm_pmin, pmax=args.norm_pmax, do_after=args.norm_undo)
 
+    n_tiles = args.n_tiles
+    if n_tiles is not None and len(n_tiles)==1:
+        n_tiles = n_tiles[0]
+
     processed = []
 
     # process all files
-    for file_in in tqdm(file_list, disable=args.quiet):
+    for file_in in tqdm(file_list, disable=args.quiet or (n_tiles is not None and np.prod(n_tiles)>1)):
         # construct output file name
         file_out = Path(args.output_dir) / args.output_name.format (
             file_path = str(file_in.relative_to(args.input_dir).parent),
@@ -128,7 +133,7 @@ def main():
 
         # load and predict restored image
         img = imread(str(file_in))
-        restored = model.predict(img, axes=args.input_axes, normalizer=normalizer, n_tiles=args.n_tiles)
+        restored = model.predict(img, axes=args.input_axes, normalizer=normalizer, n_tiles=n_tiles)
 
         # restored image could be multi-channel even if input image is not
         axes_out = axes_check_and_normalize(args.input_axes)

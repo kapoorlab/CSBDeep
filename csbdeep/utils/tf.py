@@ -13,7 +13,8 @@ from keras import backend as K
 from keras.callbacks import Callback
 from keras.layers import Lambda
 
-from .utils import _raise, is_tf_backend, save_json, tempfile, backend_channels_last
+from .utils import _raise, is_tf_backend, save_json, backend_channels_last
+from .six import tempfile
 
 
 
@@ -119,6 +120,29 @@ def export_SavedModel(model, outpath, meta={}, format='zip'):
 
 
 
+def tf_normalize(x, pmin=1, pmax=99.8, axis=None, clip=False):
+    assert pmin < pmax
+    mi = tf.contrib.distributions.percentile(x,pmin, axis=axis, keep_dims=True)
+    ma = tf.contrib.distributions.percentile(x,pmax, axis=axis, keep_dims=True)
+    y = (x-mi)/(ma-mi+K.epsilon())
+    if clip:
+        y = K.clip(y,0,1.0)
+    return y
+
+def tf_normalize_layer(layer, n_channels_out, n_dim_out, pmin=1, pmax=99.8, clip=True):
+    def norm(x,axis=None):
+        return tf_normalize(x, pmin=pmin, pmax=pmax, axis=axis, clip=clip)
+    if n_dim_out > 4:
+        out = Lambda(lambda x: norm(K.max(K.max(x, axis=1), axis=-1, keepdims=True), axis=(1,2,3)))(layer)
+    else:
+        if n_channels_out > 3:
+            out = Lambda(lambda x: norm(K.max(x, axis=-1, keepdims=True)))(layer)
+        elif n_channels_out ==2:
+            out = Lambda(lambda x: norm(K.concatenate([x,x[...,:1]], axis=-1)))(layer)
+        else:
+            out = Lambda(lambda x: norm(x, axis=(1,2)))(layer)
+    return out
+
 
 class CARETensorBoard(Callback):
     """ TODO """
@@ -167,21 +191,11 @@ class CARETensorBoard(Callback):
         n_channels_in = self.model.input_shape[-1]
         n_dim_in = len(self.model.input_shape)
 
-        # FIXME: not fully baked, eg. n_dim==5 multichannel doesnt work
-
-        if n_dim_in > 4:
-            # print("tensorboard shape: %s"%str(self.model.input_shape))
-            input_layer = Lambda(lambda x: K.max(K.max(x, axis=1), axis=-1, keepdims=True))(self.model.input)
-        else:
-            if n_channels_in > 3:
-                input_layer = Lambda(lambda x: K.max(x, axis=-1, keepdims=True))(self.model.input)
-            elif n_channels_in == 2:
-                input_layer = Lambda(lambda x: K.concatenate([x,x[...,:1]], axis=-1))(self.model.input)
-            else:
-                input_layer = self.model.input
-
         n_channels_out = self.model.output_shape[-1]
         n_dim_out = len(self.model.output_shape)
+
+        # FIXME: not fully baked, eg. n_dim==5 multichannel doesnt work
+
 
         sep = n_channels_out
         if self.prob_out:
@@ -192,49 +206,10 @@ class CARETensorBoard(Callback):
             n_channels_out % 2 == 0 or _raise(ValueError())
             sep = sep // 2
 
-        if n_dim_out > 4:
-            output_layer = Lambda(lambda x: K.max(K.max(x[...,:sep], axis=1), axis=-1, keepdims=True))(self.model.output)
-        else:
-            if sep > 3:
-                output_layer = Lambda(lambda x: K.max(x[...,:sep], axis=-1, keepdims=True))(self.model.output)
-            elif sep == 2:
-                output_layer = Lambda(lambda x: K.concatenate([x[...,:sep],x[...,:1]], axis=-1))(self.model.output)
-            else:
-                output_layer = Lambda(lambda x: x[...,:sep])(self.model.output)
-
+        input_layer = tf_normalize_layer(self.model.input, n_channels_in, n_dim_in)
+        output_layer = tf_normalize_layer(self.model.output[...,:sep], sep, n_dim_out)
         if self.prob_out:
-            # scale images
-            if n_dim_out > 4:
-                scale_layer = Lambda(lambda x: K.max(K.max(x[...,sep:], axis=1), axis=-1, keepdims=True))(self.model.output)
-            else:
-                if sep > 3:
-                    scale_layer = Lambda(lambda x: K.max(x[...,sep:], axis=-1, keepdims=True))(self.model.output)
-                elif sep == 2:
-                    scale_layer = Lambda(lambda x: K.concatenate([x[...,sep:],x[...,-1:]], axis=-1))(self.model.output)
-                else:
-                    scale_layer = Lambda(lambda x: x[...,sep:])(self.model.output)
-
-        #
-        #     n_channels = self.model.input_shape[0]
-        #     if n_channels > 1:
-        #         #input_layer  = Lambda(lambda x: x[n_channels // 2:n_channels // 2 + 1, :, :, :])(self.model.input)
-        #         input_layer = Lambda(lambda x: K.max(x, axis = 0))(self.model.input)
-        #     else:
-        #         input_layer = self.model.input
-        # #
-        # if K.image_dim_ordering() == "tf":
-        #     n_channels = self.model.input_shape[-1]
-        #     if n_channels>1:
-        #         input_layer = Lambda(lambda x: x[:, :, :, n_channels // 2:n_channels // 2 + 1])(self.model.input)
-        #     else:
-        #         input_layer = self.model.input
-        # else:
-        #     n_channels = self.model.input_shape[0]
-        #     if n_channels > 1:
-        #         #input_layer  = Lambda(lambda x: x[n_channels // 2:n_channels // 2 + 1, :, :, :])(self.model.input)
-        #         input_layer = Lambda(lambda x: K.max(x, axis = 0))(self.model.input)
-        #     else:
-        #         input_layer = self.model.input
+            scale_layer = tf_normalize_layer(self.model.output[...,sep:], sep, n_dim_out, pmin=0, pmax=100)
 
         tf_sums.append(tf.summary.image('input', input_layer, max_outputs=self.n_images))
         if self.prob_out:

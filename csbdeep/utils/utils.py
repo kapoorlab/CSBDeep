@@ -5,19 +5,7 @@ import numpy as np
 import json
 import collections
 from six.moves import range, zip, map, reduce, filter
-
-try:
-    from pathlib import Path
-    Path().expanduser()
-except (ImportError,AttributeError):
-    from pathlib2 import Path
-
-try:
-    import tempfile
-    tempfile.TemporaryDirectory
-except (ImportError,AttributeError):
-    from backports import tempfile
-
+from .six import Path
 
 ###
 
@@ -83,6 +71,14 @@ def normalize_mi_ma(x, mi, ma, clip=False, eps=1e-20, dtype=np.float32):
     return x
 
 
+def normalize_minmse(x, target):
+    """Affine rescaling of x, such that the mean squared error to target is minimal."""
+    cov = np.cov(x.flatten(),target.flatten())
+    alpha = cov[0,1] / (cov[0,0]+1e-10)
+    beta = target.mean() - alpha*x.mean()
+    return alpha*x + beta
+
+
 ###
 
 
@@ -105,7 +101,24 @@ def compose(*funcs):
 def download_and_extract_zip_file(url, targetdir='.', verbose=True):
     import csv
     from six.moves.urllib.request import urlretrieve
+    from six.moves.urllib.parse import urlparse
     from zipfile import ZipFile
+
+    res = urlparse(url)
+    if res.scheme in ('','file'):
+        url = Path(res.path).resolve().as_uri()
+        # local file, 'urlretrieve' will not make a copy
+        # -> don't delete 'downloaded' file
+        delete = False
+    else:
+        delete = True
+
+    # verbosity levels:
+    # - 0: no messages
+    # - 1: status messages
+    # - 2: status messages and list of all files
+    if isinstance(verbose,bool):
+        verbose *= 2
 
     log = (print) if verbose else (lambda *a,**k: None)
 
@@ -123,8 +136,9 @@ def download_and_extract_zip_file(url, targetdir='.', verbose=True):
         except:
             return True
         finally:
-            try: os.unlink(filepath)
-            except: pass
+            if delete:
+                try: os.unlink(filepath)
+                except: pass
 
         for size, relpath in contents:
             size, relpath = int(size.strip()), relpath.strip()
@@ -150,15 +164,16 @@ def download_and_extract_zip_file(url, targetdir='.', verbose=True):
                 log(' extracting...',end='')
                 zip_file.extractall(str(targetdir))
                 provided = zip_file.namelist()
-            log(' done.\n')
+            log(' done.')
         finally:
-            try: os.unlink(filepath)
-            except: pass
+            if delete:
+                try: os.unlink(filepath)
+                except: pass
     else:
-        log('Files found, nothing to download.\n')
+        log('Files found, nothing to download.')
 
-    if verbose:
-        log(str(targetdir)+':')
+    if verbose > 1:
+        log('\n'+str(targetdir)+':')
         consume(map(lambda x: log('-',Path(x)), provided))
 
 
@@ -170,6 +185,7 @@ def axes_check_and_normalize(axes,length=None,disallowed=None,return_allowed=Fal
     S(ample), T(ime), C(hannel), Z, Y, X
     """
     allowed = 'STCZYX'
+    axes is not None or _raise(ValueError('axis cannot be None.'))
     axes = str(axes).upper()
     consume(a in allowed or _raise(ValueError("invalid axis '%s', must be one of %s."%(a,list(allowed)))) for a in axes)
     disallowed is None or consume(a not in disallowed or _raise(ValueError("disallowed axis '%s'."%a)) for a in axes)
@@ -206,7 +222,7 @@ def move_image_axes(x, fr, to, adjust_singletons=False):
                 # remove singleton axis
                 slices[i] = 0
                 fr = fr.replace(a,'')
-        x = x[slices]
+        x = x[tuple(slices)]
         # add dummy axes present in 'to'
         for i,a in enumerate(to):
             if (a not in fr):

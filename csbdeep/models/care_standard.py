@@ -1,20 +1,24 @@
+# -*- coding: utf-8 -*-
 from __future__ import print_function, unicode_literals, absolute_import, division
 
 import datetime
 import warnings
 
+import numpy as np
 import tensorflow as tf
-from six import string_types
+from six import string_types, PY2
+from functools import wraps
 
 from csbdeep.internals.probability import ProbabilisticPrediction
 from .config import Config
 
-from ..utils import _raise, Path, load_json, save_json, axes_check_and_normalize, axes_dict, move_image_axes
+from ..utils import _raise, load_json, save_json, axes_check_and_normalize, axes_dict, move_image_axes
+from ..utils.six import Path, FileNotFoundError
 from ..utils.tf import export_SavedModel
 from ..version import __version__ as package_version
 from ..data import Normalizer, NoNormalizer, PercentileNormalizer
 from ..data import Resizer, NoResizer, PadAndCropResizer
-from ..internals.predict import predict_direct, predict_tiled, tile_overlap
+from ..internals.predict import predict_tiled, tile_overlap, Progress
 from ..internals import nets, train
 
 
@@ -35,6 +39,7 @@ class CARE(object):
         Model name. Uses a timestamp if set to ``None`` (default).
     basedir : str
         Directory that contains (or will contain) a folder with the given model name.
+        Use ``None`` to disable saving (or loading) any data to (or from) disk (regardless of other parameters).
 
     Raises
     ------
@@ -66,22 +71,57 @@ class CARE(object):
         if config is not None and not config.is_valid():
             invalid_attr = config.is_valid(True)[1]
             raise ValueError('Invalid configuration attributes: ' + ', '.join(invalid_attr))
+        (not (config is None and basedir is None)) or _raise(ValueError())
 
-        name is None or isinstance(name,string_types) or _raise(ValueError())
-        isinstance(basedir,(string_types,Path)) or _raise(ValueError())
+        name is None or (isinstance(name,string_types) and len(name)>0) or _raise(ValueError())
+        basedir is None or isinstance(basedir,(string_types,Path)) or _raise(ValueError())
         self.config = config
-        self.basedir = Path(basedir)
-        self.name = name
+        self.name = name if name is not None else datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S.%f")
+        self.basedir = Path(basedir) if basedir is not None else None
+        if config is not None:
+            # config was provided -> update before it is saved to disk
+            self._update_and_check_config()
         self._set_logdir()
+        if config is None:
+            # config was loaded from disk -> update it after loading
+            self._update_and_check_config()
         self._model_prepared = False
         self.keras_model = self._build()
         if config is None:
             self._find_and_load_weights()
 
 
+    def __repr__(self):
+        s = ("{self.__class__.__name__}({self.name}): {self.config.axes} → {self._axes_out}\n".format(self=self) +
+             "├─ Directory: {}\n".format(self.logdir.resolve() if self.basedir is not None else None) +
+             self._repr_extra() +
+             "└─ {self.config}".format(self=self))
+        return s.encode('utf-8') if PY2 else s
+
+
+    def _repr_extra(self):
+        return ""
+
+
+    def _update_and_check_config(self):
+        pass
+
+
+    def suppress_without_basedir(warn):
+        def _suppress_without_basedir(f):
+            @wraps(f)
+            def wrapper(*args, **kwargs):
+                self = args[0]
+                if self.basedir is None:
+                    warn is False or warnings.warn("Suppressing call of '%s' (due to basedir=None)." % f.__name__)
+                else:
+                    return f(*args, **kwargs)
+            return wrapper
+        return _suppress_without_basedir
+
+
+    @suppress_without_basedir(warn=False)
     def _set_logdir(self):
-        if self.name is None:
-            self.name = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S.%f")
         self.logdir = self.basedir / self.name
 
         config_file =  self.logdir / 'config.json'
@@ -101,6 +141,7 @@ class CARE(object):
             save_json(vars(self.config), str(config_file))
 
 
+    @suppress_without_basedir(warn=False)
     def _find_and_load_weights(self,prefer='best'):
         from itertools import chain
         # get all weight files and sort by modification time descending (newest first)
@@ -130,6 +171,7 @@ class CARE(object):
         )(self.config.unet_input_shape)
 
 
+    @suppress_without_basedir(warn=True)
     def load_weights(self, name='weights_best.h5'):
         """Load neural network weights from model folder.
 
@@ -164,13 +206,15 @@ class CARE(object):
             optimizer = Adam(lr=self.config.train_learning_rate)
         self.callbacks = train.prepare_model(self.keras_model, optimizer, self.config.train_loss, **kwargs)
 
-        if self.config.train_checkpoint is not None:
-            from keras.callbacks import ModelCheckpoint
-            self.callbacks.append(ModelCheckpoint(str(self.logdir / self.config.train_checkpoint), save_best_only=True, save_weights_only=True))
+        if self.basedir is not None:
+            if self.config.train_checkpoint is not None:
+                from keras.callbacks import ModelCheckpoint
+                self.callbacks.append(ModelCheckpoint(str(self.logdir / self.config.train_checkpoint), save_best_only=True,  save_weights_only=True))
+                self.callbacks.append(ModelCheckpoint(str(self.logdir / 'weights_now.h5'),             save_best_only=False, save_weights_only=True))
 
-        if self.config.train_tensorboard:
-            from ..utils.tf import CARETensorBoard
-            self.callbacks.append(CARETensorBoard(log_dir=str(self.logdir), prefix_with_timestamp=False, n_images=3, write_images=True, prob_out=self.config.probabilistic))
+            if self.config.train_tensorboard:
+                from ..utils.tf import CARETensorBoard
+                self.callbacks.append(CARETensorBoard(log_dir=str(self.logdir), prefix_with_timestamp=False, n_images=3, write_images=True, prob_out=self.config.probabilistic))
 
         if self.config.train_reduce_lr is not None:
             from keras.callbacks import ReduceLROnPlateau
@@ -215,14 +259,13 @@ class CARE(object):
             warnings.warn("small number of validation images (only %.1f%% of all images)" % (100*frac_val))
         axes = axes_check_and_normalize('S'+self.config.axes,X.ndim)
         ax = axes_dict(axes)
-        div_by = 2**self.config.unet_n_depth
-        axes_relevant = ''.join(a for a in 'XYZT' if a in axes)
-        for a in axes_relevant:
+
+        for a,div_by in zip(axes,self._axes_div_by(axes)):
             n = X.shape[ax[a]]
             if n % div_by != 0:
                 raise ValueError(
-                    "training images must be evenly divisible by %d along axes %s"
-                    " (axis %s has incompatible size %d)" % (div_by,axes_relevant,a,n)
+                    "training images must be evenly divisible by %d along axis %s"
+                    " (which has incompatible size %d)" % (div_by,a,n)
                 )
 
         if epochs is None:
@@ -239,14 +282,22 @@ class CARE(object):
                                                  epochs=epochs, steps_per_epoch=steps_per_epoch,
                                                  callbacks=self.callbacks, verbose=1)
 
-        self.keras_model.save_weights(str(self.logdir / 'weights_last.h5'))
+        if self.basedir is not None:
+            self.keras_model.save_weights(str(self.logdir / 'weights_last.h5'))
 
-        if self.config.train_checkpoint is not None:
-            self.load_weights(self.config.train_checkpoint)
+            if self.config.train_checkpoint is not None:
+                print()
+                self._find_and_load_weights(self.config.train_checkpoint)
+                try:
+                    # remove temporary weights
+                    (self.logdir / 'weights_now.h5').unlink()
+                except FileNotFoundError:
+                    pass
 
         return history
 
 
+    @suppress_without_basedir(warn=True)
     def export_TF(self):
         """Export neural network via :func:`csbdeep.utils.tf.export_SavedModel`."""
         fout = self.logdir / 'TF_SavedModel.zip'
@@ -255,14 +306,14 @@ class CARE(object):
             'version':       package_version,
             'probabilistic': self.config.probabilistic,
             'axes':          self.config.axes,
-            'axes_div_by':   [(2**self.config.unet_n_depth if a in 'XYZT' else 1) for a in self.config.axes],
-            'tile_overlap':  tile_overlap(self.config.unet_n_depth, self.config.unet_kern_size),
+            'axes_div_by':   self._axes_div_by(self.config.axes),
+            'tile_overlap':  self._axes_tile_overlap(self.config.axes),
         }
         export_SavedModel(self.keras_model, str(fout), meta=meta)
         print("\nModel exported in TensorFlow's SavedModel format:\n%s" % str(fout.resolve()))
 
 
-    def predict(self, img, axes, normalizer=PercentileNormalizer(), resizer=PadAndCropResizer(), n_tiles=1):
+    def predict(self, img, axes, normalizer=PercentileNormalizer(), resizer=PadAndCropResizer(), n_tiles=None):
         """Apply neural network to raw image to predict restored image.
 
         Parameters
@@ -276,12 +327,14 @@ class CARE(object):
         resizer : :class:`csbdeep.data.Resizer` or None
             If necessary, input image is resized to enable neural network prediction and result is (possibly)
             resized to yield original image size.
-        n_tiles : int
+        n_tiles : iterable or None
             Out of memory (OOM) errors can occur if the input image is too large.
             To avoid this problem, the input image is broken up into (overlapping) tiles
             that can then be processed independently and re-assembled to yield the restored image.
-            This parameter denotes the number of tiles. Note that if the number of tiles is too low,
-            it is adaptively increased until OOM errors are avoided, albeit at the expense of runtime.
+            This parameter denotes a tuple of the number of tiles for every image axis.
+            Note that if the number of tiles is too low, it is adaptively increased until
+            OOM errors are avoided, albeit at the expense of runtime.
+            A value of ``None`` denotes that no tiling should initially be used.
 
         Returns
         -------
@@ -295,7 +348,7 @@ class CARE(object):
         return self._predict_mean_and_scale(img, axes, normalizer, resizer, n_tiles)[0]
 
 
-    def predict_probabilistic(self, img, axes, normalizer=PercentileNormalizer(), resizer=PadAndCropResizer(), n_tiles=1):
+    def predict_probabilistic(self, img, axes, normalizer=PercentileNormalizer(), resizer=PadAndCropResizer(), n_tiles=None):
         """Apply neural network to raw image to predict probability distribution for restored image.
 
         See :func:`predict` for parameter explanations.
@@ -316,7 +369,7 @@ class CARE(object):
         return ProbabilisticPrediction(mean, scale)
 
 
-    def _predict_mean_and_scale(self, img, axes, normalizer, resizer, n_tiles=1):
+    def _predict_mean_and_scale(self, img, axes, normalizer, resizer, n_tiles=None):
         """Apply neural network to raw image to predict restored image.
 
         See :func:`predict` for parameter explanations.
@@ -329,45 +382,106 @@ class CARE(object):
 
         """
         normalizer, resizer = self._check_normalizer_resizer(normalizer, resizer)
-        axes = axes_check_and_normalize(axes,img.ndim)
-        _permute_axes = self._make_permute_axes(axes, self.config.axes)
+        # axes = axes_check_and_normalize(axes,img.ndim)
 
+        # different kinds of axes
+        # -> typical case: net_axes_in = net_axes_out, img_axes_in = img_axes_out
+        img_axes_in = axes_check_and_normalize(axes,img.ndim)
+        net_axes_in = self.config.axes
+        net_axes_out = axes_check_and_normalize(self._axes_out)
+        set(net_axes_out).issubset(set(net_axes_in)) or _raise(ValueError("different kinds of output than input axes"))
+        net_axes_lost = set(net_axes_in).difference(set(net_axes_out))
+        img_axes_out = ''.join(a for a in img_axes_in if a not in net_axes_lost)
+        # print(' -> '.join((img_axes_in, net_axes_in, net_axes_out, img_axes_out)))
+        tiling_axes = net_axes_out.replace('C','') # axes eligible for tiling
+
+        _permute_axes = self._make_permute_axes(img_axes_in, net_axes_in, net_axes_out, img_axes_out)
+        # _permute_axes: (img_axes_in -> net_axes_in), undo: (net_axes_out -> img_axes_out)
         x = _permute_axes(img)
-        channel = axes_dict(self.config.axes)['C']
+        # x has net_axes_in semantics
+        x_tiling_axis = tuple(axes_dict(net_axes_in)[a] for a in tiling_axes) # numerical axis ids for x
 
-        self.config.n_channel_in == x.shape[channel] or _raise(ValueError())
+        channel_in = axes_dict(net_axes_in)['C']
+        channel_out = axes_dict(net_axes_out)['C']
+        net_axes_in_div_by = self._axes_div_by(net_axes_in)
+        net_axes_in_overlaps = self._axes_tile_overlap(net_axes_in)
+        self.config.n_channel_in == x.shape[channel_in] or _raise(ValueError())
 
-        # normalize
-        x = normalizer.before(x,self.config.axes)
-        # resize: make divisible by power of 2 to allow downsampling steps in unet
-        div_n = 2 ** self.config.unet_n_depth
-        x = resizer.before(x,div_n,exclude=channel)
+        # TODO: refactor tiling stuff to make code more readable
+
+        _permute_axes_n_tiles = self._make_permute_axes(img_axes_in, net_axes_in)
+        # _permute_axes_n_tiles: (img_axes_in <-> net_axes_in) to convert n_tiles between img and net axes
+        def _permute_n_tiles(n,undo=False):
+            # hack: move tiling axis around in the same way as the image was permuted by creating an array
+            return _permute_axes_n_tiles(np.empty(n,np.bool),undo=undo).shape
+
+        # to support old api: set scalar n_tiles value for the largest tiling axis
+        if np.isscalar(n_tiles) and int(n_tiles)==n_tiles and 1<=n_tiles:
+            largest_tiling_axis = [i for i in np.argsort(x.shape) if i in x_tiling_axis][-1]
+            _n_tiles = [n_tiles if i==largest_tiling_axis else 1 for i in range(x.ndim)]
+            n_tiles = _permute_n_tiles(_n_tiles,undo=True)
+            warnings.warn("n_tiles should be a tuple with an entry for each image axis")
+            print("Changing n_tiles to %s" % str(n_tiles))
+
+        if n_tiles is None:
+            n_tiles = [1]*img.ndim
+        try:
+            n_tiles = tuple(n_tiles)
+            img.ndim == len(n_tiles) or _raise(TypeError())
+        except TypeError:
+            raise ValueError("n_tiles must be an iterable of length %d" % img.ndim)
+
+        all(np.isscalar(t) and 1<=t and int(t)==t for t in n_tiles) or _raise(
+            ValueError("all values of n_tiles must be integer values >= 1"))
+        n_tiles = tuple(map(int,n_tiles))
+        n_tiles = _permute_n_tiles(n_tiles)
+        (all(n_tiles[i] == 1 for i in range(x.ndim) if i not in x_tiling_axis) or
+            _raise(ValueError("entry of n_tiles > 1 only allowed for axes '%s'" % tiling_axes)))
+        n_tiles_limited = self._limit_tiling(x.shape,n_tiles,net_axes_in_div_by)
+        if any(np.array(n_tiles) != np.array(n_tiles_limited)):
+            print("Limiting n_tiles to %s" % str(_permute_n_tiles(n_tiles_limited,undo=True)))
+        n_tiles = n_tiles_limited
+
+
+        # normalize & resize
+        x = normalizer.before(x, net_axes_in)
+        x = resizer.before(x, net_axes_in, net_axes_in_div_by)
 
         done = False
+        progress = Progress(np.prod(n_tiles),1)
         while not done:
             try:
-                if n_tiles == 1:
-                    x = predict_direct(self.keras_model,x,channel_in=channel,channel_out=channel)
-                else:
-                    overlap = tile_overlap(self.config.unet_n_depth, self.config.unet_kern_size)
-                    x = predict_tiled(self.keras_model,x,channel_in=channel,channel_out=channel,
-                                      n_tiles=n_tiles,block_size=div_n,tile_overlap=overlap)
+                # raise tf.errors.ResourceExhaustedError(None,None,None) # tmp
+                x = predict_tiled(self.keras_model,x,axes_in=net_axes_in,axes_out=net_axes_out,
+                                  n_tiles=n_tiles,block_sizes=net_axes_in_div_by,tile_overlaps=net_axes_in_overlaps,pbar=progress)
+                # x has net_axes_out semantics
                 done = True
+                progress.close()
             except tf.errors.ResourceExhaustedError:
-                n_tiles = max(4, 2*n_tiles)
-                print('Out of memory, retrying with n_tiles = %d' % n_tiles)
+                # TODO: how to test this code?
+                n_tiles_prev = list(n_tiles) # make a copy
+                tile_sizes_approx = np.array(x.shape) / np.array(n_tiles)
+                t = [i for i in np.argsort(tile_sizes_approx) if i in x_tiling_axis][-1]
+                n_tiles[t] *= 2
+                n_tiles = self._limit_tiling(x.shape,n_tiles,net_axes_in_div_by)
+                if all(np.array(n_tiles) == np.array(n_tiles_prev)):
+                    raise MemoryError("Tile limit exceeded. Memory occupied by another process (notebook)?")
+                print('Out of memory, retrying with n_tiles = %s' % str(_permute_n_tiles(n_tiles,undo=True)))
+                progress.total = np.prod(n_tiles)
 
         n_channel_predicted = self.config.n_channel_out * (2 if self.config.probabilistic else 1)
-        x.shape[channel] == n_channel_predicted or _raise(ValueError())
+        x.shape[channel_out] == n_channel_predicted or _raise(ValueError())
 
-        x = resizer.after(x,exclude=channel)
+        x = resizer.after(x, net_axes_out)
 
-        mean, scale = self._mean_and_scale_from_prediction(x,axis=channel)
+        mean, scale = self._mean_and_scale_from_prediction(x,axis=channel_out)
+        # mean and scale have net_axes_out semantics
 
         if normalizer.do_after and self.config.n_channel_in==self.config.n_channel_out:
-            mean, scale = normalizer.after(mean, scale)
+            mean, scale = normalizer.after(mean, scale, net_axes_out)
 
         mean, scale = _permute_axes(mean,undo=True), _permute_axes(scale,undo=True)
+        # mean and scale have img_axes_out semantics
 
         return mean, scale
 
@@ -379,35 +493,37 @@ class CARE(object):
             assert x.shape[axis] == 2*_n
             slices = [slice(None) for _ in x.shape]
             slices[axis] = slice(None,_n)
-            mean = x[slices]
+            mean = x[tuple(slices)]
             slices[axis] = slice(_n,None)
-            scale = x[slices]
+            scale = x[tuple(slices)]
         else:
             mean, scale = x, None
         return mean, scale
 
-    def _make_permute_axes(self,axes_in,axes_out=None):
-        if axes_out is None:
-            axes_out = self.config.axes
-        channel_in  = axes_dict(axes_in) ['C']
-        channel_out = axes_dict(axes_out)['C']
-        assert channel_out is not None
+    def _make_permute_axes(self, img_axes_in, net_axes_in, net_axes_out=None, img_axes_out=None):
+        # img_axes_in -> net_axes_in ---NN--> net_axes_out -> img_axes_out
+        if net_axes_out is None:
+            net_axes_out = net_axes_in
+        if img_axes_out is None:
+            img_axes_out = img_axes_in
+        assert 'C' in net_axes_in and 'C' in net_axes_out
+        assert not 'C' in img_axes_in or 'C' in img_axes_out
 
         def _permute_axes(data,undo=False):
             if data is None:
                 return None
             if undo:
-                if channel_in is not None:
-                    return move_image_axes(data, axes_out, axes_in, True)
+                if 'C' in img_axes_in:
+                    return move_image_axes(data, net_axes_out, img_axes_out, True)
                 else:
                     # input is single-channel and has no channel axis
-                    data = move_image_axes(data, axes_out, axes_in+'C', True)
-                    # output is single-channel -> remove channel axis
+                    data = move_image_axes(data, net_axes_out, img_axes_out+'C', True)
                     if data.shape[-1] == 1:
+                        # output is single-channel -> remove channel axis
                         data = data[...,0]
                     return data
             else:
-                return move_image_axes(data, axes_in, axes_out, True)
+                return move_image_axes(data, img_axes_in, net_axes_in, True)
         return _permute_axes
 
     def _check_normalizer_resizer(self, normalizer, resizer):
@@ -423,3 +539,23 @@ class CARE(object):
                               'number of input and output channels differ.')
 
         return normalizer, resizer
+
+    def _limit_tiling(self,img_shape,n_tiles,block_sizes):
+        img_shape, n_tiles, block_sizes = np.array(img_shape), np.array(n_tiles), np.array(block_sizes)
+        n_tiles_limit = np.ceil(img_shape / block_sizes) # each tile must be at least one block in size
+        return [int(t) for t in np.minimum(n_tiles,n_tiles_limit)]
+
+    def _axes_div_by(self, query_axes):
+        query_axes = axes_check_and_normalize(query_axes)
+        # default: must be divisible by power of 2 to allow down/up-sampling steps in unet
+        pool_div_by = 2**self.config.unet_n_depth
+        return tuple((pool_div_by if a in 'XYZT' else 1) for a in query_axes)
+
+    def _axes_tile_overlap(self, query_axes):
+        query_axes = axes_check_and_normalize(query_axes)
+        overlap = tile_overlap(self.config.unet_n_depth, self.config.unet_kern_size)
+        return tuple((overlap if a in 'XYZT' else None) for a in query_axes)
+
+    @property
+    def _axes_out(self):
+        return self.config.axes

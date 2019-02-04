@@ -6,6 +6,8 @@ import numpy as np
 import argparse
 import warnings
 
+from distutils.version import LooseVersion
+import keras
 import keras.backend as K
 
 from ..utils import _raise, axes_check_and_normalize, axes_dict, backend_channels_last
@@ -64,7 +66,7 @@ class Config(argparse.Namespace):
     train_checkpoint : str
         Name of checkpoint file for model weights (only best are saved); set to ``None`` to disable. Default: ``weights_best.h5``
     train_reduce_lr : dict
-        Parameter :class:`dict` of ReduceLROnPlateau_ callback; set to ``None`` to disable. Default: ``{'factor': 0.5, 'patience': 10}``
+        Parameter :class:`dict` of ReduceLROnPlateau_ callback; set to ``None`` to disable. Default: ``{'factor': 0.5, 'patience': 10, 'min_delta': 0}``
 
         .. _ReduceLROnPlateau: https://keras.io/callbacks/#reducelronplateau
     """
@@ -124,7 +126,10 @@ class Config(argparse.Namespace):
         self.train_batch_size      = 16
         self.train_tensorboard     = True
         self.train_checkpoint      = 'weights_best.h5'
-        self.train_reduce_lr       = {'factor': 0.5, 'patience': 10}
+
+        # the parameter 'min_delta' was called 'epsilon' for keras<=2.1.5
+        min_delta_key = 'epsilon' if LooseVersion(keras.__version__)<=LooseVersion('2.1.5') else 'min_delta'
+        self.train_reduce_lr       = {'factor': 0.5, 'patience': 10, min_delta_key: 0}
 
         # disallow setting 'n_dim' manually
         try:
@@ -172,10 +177,10 @@ class Config(argparse.Namespace):
         ok['unet_n_first']         = _is_int(self.unet_n_first,1)
         ok['unet_last_activation'] = self.unet_last_activation in ('linear','relu')
         ok['unet_input_shape'] = (
-            isinstance(self.unet_input_shape,(list,tuple)) and
-            len(self.unet_input_shape) == self.n_dim+1 and
-            self.unet_input_shape[-1] == self.n_channel_in and
-            all((d is None or (_is_int(d) and d%(2**self.unet_n_depth)==0) for d in self.unet_input_shape[:-1]))
+                isinstance(self.unet_input_shape,(list,tuple))
+            and len(self.unet_input_shape) == self.n_dim+1
+            and self.unet_input_shape[-1] == self.n_channel_in
+            # and all((d is None or (_is_int(d) and d%(2**self.unet_n_depth)==0) for d in self.unet_input_shape[:-1]))
         )
         ok['train_loss'] = (
             (    self.probabilistic and self.train_loss == 'laplace'   ) or
