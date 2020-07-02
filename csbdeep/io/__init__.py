@@ -7,7 +7,8 @@ import numpy as np
 from tifffile import imsave
 import warnings
 
-from ..utils import _raise, Path, axes_check_and_normalize, axes_dict, move_image_axes, move_channel_for_backend, backend_channels_last
+from ..utils import _raise, axes_check_and_normalize, axes_dict, move_image_axes, move_channel_for_backend, backend_channels_last
+from ..utils.six import Path
 
 
 
@@ -84,7 +85,8 @@ def load_training_data(file, validation_split=0, axes=None, n_images=None, verbo
         axes = f['axes']
     axes = axes_check_and_normalize(axes)
 
-    assert X.shape == Y.shape
+    # assert X.shape == Y.shape
+    assert X.ndim == Y.ndim
     assert len(axes) == X.ndim
     assert 'C' in axes
     if n_images is None:
@@ -120,7 +122,7 @@ def load_training_data(file, validation_split=0, axes=None, n_images=None, verbo
     if verbose:
         ax = axes_dict(axes)
         n_train, n_val = len(X), len(X_t) if validation_split>0 else 0
-        image_size = tuple( X.shape[ax[a]] for a in 'TZYX' if a in axes )
+        image_size = tuple( X.shape[ax[a]] for a in axes if a in 'TZYX' )
         n_dim = len(image_size)
         n_channel_in, n_channel_out = X.shape[ax['C']], Y.shape[ax['C']]
 

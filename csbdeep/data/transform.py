@@ -214,7 +214,7 @@ def anisotropic_distortions(
             return slice(None) if v==0 else slice(v//2,-(v-v//2))
         slices = [slice(None) for _ in x.shape]
         slices[0] = _split_slice(x.shape[0]-size)
-        return x[slices]
+        return x[tuple(slices)]
 
 
     def _generator(inputs):
@@ -248,7 +248,7 @@ def anisotropic_distortions(
                     ch = axes_dict(axes)['C']
                     n_channels = x.shape[ch]
                     # convolve with psf separately for every channel
-                    if _psf.shape[ch] == 1:
+                    if _psf.shape[ch] == 1 and n_channels > 1:
                         warnings.warn('applying same psf to every channel of the image.')
                     if _psf.shape[ch] in (1,n_channels):
                         x = np.stack([

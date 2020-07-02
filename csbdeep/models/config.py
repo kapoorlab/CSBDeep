@@ -6,12 +6,77 @@ import numpy as np
 import argparse
 import warnings
 
+from distutils.version import LooseVersion
+import keras
 import keras.backend as K
 
 from ..utils import _raise, axes_check_and_normalize, axes_dict, backend_channels_last
 
 
-class Config(argparse.Namespace):
+class BaseConfig(argparse.Namespace):
+
+    def __init__(self, axes='YX', n_channel_in=1, n_channel_out=1, allow_new_parameters=False, **kwargs):
+
+        # parse and check axes
+        axes = axes_check_and_normalize(axes)
+        ax = axes_dict(axes)
+        ax = {a: (ax[a] is not None) for a in ax}
+
+        (ax['X'] and ax['Y']) or _raise(ValueError('lateral axes X and Y must be present.'))
+        # not (ax['Z'] and ax['T']) or _raise(ValueError('using Z and T axes together not supported.'))
+
+        axes.startswith('S') or (not ax['S']) or _raise(ValueError('sample axis S must be first.'))
+        axes = axes.replace('S','') # remove sample axis if it exists
+
+        n_dim = len(axes.replace('C',''))
+
+        # TODO: Config not independent of backend. Problem?
+        # could move things around during train/predict as an alternative... good idea?
+        # otherwise, users can choose axes of input image anyhow, so doesn't matter if model is fixed to something else
+        if backend_channels_last():
+            if ax['C']:
+                axes[-1] == 'C' or _raise(ValueError('channel axis must be last for backend (%s).' % K.backend()))
+            else:
+                axes += 'C'
+        else:
+            if ax['C']:
+                axes[0] == 'C' or _raise(ValueError('channel axis must be first for backend (%s).' % K.backend()))
+            else:
+                axes = 'C'+axes
+
+        self.n_dim                  = n_dim
+        self.axes                   = axes
+        self.n_channel_in           = int(max(1,n_channel_in))
+        self.n_channel_out          = int(max(1,n_channel_out))
+
+        self.train_checkpoint       = 'weights_best.h5'
+        self.train_checkpoint_last  = 'weights_last.h5'
+        self.train_checkpoint_epoch = 'weights_now.h5'
+
+        self.update_parameters(allow_new_parameters, **kwargs)
+
+
+    def is_valid(self, return_invalid=False):
+        return (True, tuple()) if return_invalid else True
+
+
+    def update_parameters(self, allow_new=False, **kwargs):
+        if not allow_new:
+            attr_new = []
+            for k in kwargs:
+                try:
+                    getattr(self, k)
+                except AttributeError:
+                    attr_new.append(k)
+            if len(attr_new) > 0:
+                raise AttributeError("Not allowed to add new parameters (%s)" % ', '.join(attr_new))
+        for k in kwargs:
+            setattr(self, k, kwargs[k])
+
+
+
+
+class Config(BaseConfig):
     """Default configuration for a CARE model.
 
     This configuration is meant to be used with :class:`CARE`
@@ -28,6 +93,8 @@ class Config(argparse.Namespace):
     probabilistic : bool
         Probabilistic prediction of per-pixel Laplace distributions or
         typical regression of per-pixel scalar values.
+    allow_new_parameters : bool
+        Allow adding new configuration attributes (i.e. not listed below).
     kwargs : dict
         Overwrite (or add) configuration attributes (see below).
 
@@ -64,46 +131,17 @@ class Config(argparse.Namespace):
     train_checkpoint : str
         Name of checkpoint file for model weights (only best are saved); set to ``None`` to disable. Default: ``weights_best.h5``
     train_reduce_lr : dict
-        Parameter :class:`dict` of ReduceLROnPlateau_ callback; set to ``None`` to disable. Default: ``{'factor': 0.5, 'patience': 10}``
+        Parameter :class:`dict` of ReduceLROnPlateau_ callback; set to ``None`` to disable. Default: ``{'factor': 0.5, 'patience': 10, 'min_delta': 0}``
 
         .. _ReduceLROnPlateau: https://keras.io/callbacks/#reducelronplateau
     """
 
-    def __init__(self, axes, n_channel_in=1, n_channel_out=1, probabilistic=False, **kwargs):
+    def __init__(self, axes='YX', n_channel_in=1, n_channel_out=1, probabilistic=False, allow_new_parameters=False, **kwargs):
         """See class docstring."""
 
-        # parse and check axes
-        axes = axes_check_and_normalize(axes)
-        ax = axes_dict(axes)
-        ax = {a: (ax[a] is not None) for a in ax}
+        super(Config, self).__init__(axes, n_channel_in, n_channel_out)
+        not ('Z' in self.axes and 'T' in self.axes) or _raise(ValueError('using Z and T axes together not supported.'))
 
-        (ax['X'] and ax['Y']) or _raise(ValueError('lateral axes X and Y must be present.'))
-        not (ax['Z'] and ax['T']) or _raise(ValueError('using Z and T axes together not supported.'))
-
-        axes.startswith('S') or (not ax['S']) or _raise(ValueError('sample axis S must be first.'))
-        axes = axes.replace('S','') # remove sample axis if it exists
-
-        n_dim = 3 if (ax['Z'] or ax['T']) else 2
-
-        # TODO: Config not independent of backend. Problem?
-        # could move things around during train/predict as an alternative... good idea?
-        # otherwise, users can choose axes of input image anyhow, so doesn't matter if model is fixed to something else
-        if backend_channels_last():
-            if ax['C']:
-                axes[-1] == 'C' or _raise(ValueError('channel axis must be last for backend (%s).' % K.backend()))
-            else:
-                axes += 'C'
-        else:
-            if ax['C']:
-                axes[0] == 'C' or _raise(ValueError('channel axis must be first for backend (%s).' % K.backend()))
-            else:
-                axes = 'C'+axes
-
-        # directly set by parameters
-        self.n_dim                 = n_dim
-        self.axes                  = axes
-        self.n_channel_in          = int(n_channel_in)
-        self.n_channel_out         = int(n_channel_out)
         self.probabilistic         = bool(probabilistic)
 
         # default config (can be overwritten by kwargs below)
@@ -123,8 +161,10 @@ class Config(argparse.Namespace):
         self.train_learning_rate   = 0.0004
         self.train_batch_size      = 16
         self.train_tensorboard     = True
-        self.train_checkpoint      = 'weights_best.h5'
-        self.train_reduce_lr       = {'factor': 0.5, 'patience': 10}
+
+        # the parameter 'min_delta' was called 'epsilon' for keras<=2.1.5
+        min_delta_key = 'epsilon' if LooseVersion(keras.__version__)<=LooseVersion('2.1.5') else 'min_delta'
+        self.train_reduce_lr       = {'factor': 0.5, 'patience': 10, min_delta_key: 0}
 
         # disallow setting 'n_dim' manually
         try:
@@ -133,8 +173,7 @@ class Config(argparse.Namespace):
         except:
             pass
 
-        for k in kwargs:
-            setattr(self, k, kwargs[k])
+        self.update_parameters(allow_new_parameters, **kwargs)
 
 
     def is_valid(self, return_invalid=False):
@@ -172,10 +211,10 @@ class Config(argparse.Namespace):
         ok['unet_n_first']         = _is_int(self.unet_n_first,1)
         ok['unet_last_activation'] = self.unet_last_activation in ('linear','relu')
         ok['unet_input_shape'] = (
-            isinstance(self.unet_input_shape,(list,tuple)) and
-            len(self.unet_input_shape) == self.n_dim+1 and
-            self.unet_input_shape[-1] == self.n_channel_in and
-            all((d is None or (_is_int(d) and d%(2**self.unet_n_depth)==0) for d in self.unet_input_shape[:-1]))
+                isinstance(self.unet_input_shape,(list,tuple))
+            and len(self.unet_input_shape) == self.n_dim+1
+            and self.unet_input_shape[-1] == self.n_channel_in
+            # and all((d is None or (_is_int(d) and d%(2**self.unet_n_depth)==0) for d in self.unet_input_shape[:-1]))
         )
         ok['train_loss'] = (
             (    self.probabilistic and self.train_loss == 'laplace'   ) or

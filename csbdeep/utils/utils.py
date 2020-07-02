@@ -4,20 +4,10 @@ import os
 import numpy as np
 import json
 import collections
+import platform
+import random
 from six.moves import range, zip, map, reduce, filter
-
-try:
-    from pathlib import Path
-    Path().expanduser()
-except (ImportError,AttributeError):
-    from pathlib2 import Path
-
-try:
-    import tempfile
-    tempfile.TemporaryDirectory
-except (ImportError,AttributeError):
-    from backports import tempfile
-
+from .six import Path
 
 ###
 
@@ -81,6 +71,14 @@ def normalize_mi_ma(x, mi, ma, clip=False, eps=1e-20, dtype=np.float32):
         x = np.clip(x,0,1)
 
     return x
+
+
+def normalize_minmse(x, target):
+    """Affine rescaling of x, such that the mean squared error to target is minimal."""
+    cov = np.cov(x.flatten(),target.flatten())
+    alpha = cov[0,1] / (cov[0,0]+1e-10)
+    beta = target.mean() - alpha*x.mean()
+    return alpha*x + beta
 
 
 ###
@@ -245,3 +243,27 @@ def move_image_axes(x, fr, to, adjust_singletons=False):
     if fr == to:
         return x
     return np.moveaxis(x, [ax_from[a] for a in fr], [ax_to[a] for a in fr])
+
+
+###
+
+
+def choice(population, k=1, replace=True):
+    ver = platform.sys.version_info
+    if replace and (ver.major,ver.minor) in [(2,7),(3,5)]: # python 2.7 or 3.5
+        # slow if population is large and not a np.ndarray
+        return list(np.random.choice(population, k, replace=replace))
+    else:
+        try:
+            # save state of 'random' and set seed using 'np.random'
+            state = random.getstate()
+            random.seed(np.random.randint(np.iinfo(int).min, np.iinfo(int).max))
+            if replace:
+                # sample with replacement
+                return random.choices(population, k=k)
+            else:
+                # sample without replacement
+                return random.sample(population, k=k)
+        finally:
+            # restore state of 'random'
+            random.setstate(state)

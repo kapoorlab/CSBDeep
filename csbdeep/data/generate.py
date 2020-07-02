@@ -7,7 +7,8 @@ import numpy as np
 import sys, os, warnings
 
 from tqdm import tqdm
-from ..utils import _raise, Path, consume, compose, normalize_mi_ma, axes_dict, axes_check_and_normalize
+from ..utils import _raise, consume, compose, normalize_mi_ma, axes_dict, axes_check_and_normalize, choice
+from ..utils.six import Path
 from ..io import save_training_data
 
 from .transform import Transform, permute_axes, broadcast_target
@@ -93,16 +94,16 @@ def sample_patches_from_multiple_stacks(datas, patch_size, n_samples, datas_mask
 
     border_slices = tuple([slice(s // 2, d - s + s // 2 + 1) for s, d in zip(patch_size, datas[0].shape)])
     valid_inds = np.where(patch_mask[border_slices])
+    n_valid = len(valid_inds[0])
 
-    if len(valid_inds[0]) == 0:
+    if n_valid == 0:
         raise ValueError("'patch_filter' didn't return any region to sample from")
 
-    valid_inds = [v + s.start for s, v in zip(border_slices, valid_inds)]
+    sample_inds = choice(range(n_valid), n_samples, replace=(n_valid < n_samples))
 
-    # sample
-    sample_inds = np.random.choice(len(valid_inds[0]), n_samples, replace=len(valid_inds[0])<n_samples)
-
-    rand_inds = [v[sample_inds] for v in valid_inds]
+    # valid_inds = [v + s.start for s, v in zip(border_slices, valid_inds)] # slow for large n_valid
+    # rand_inds = [v[sample_inds] for v in valid_inds]
+    rand_inds = [v[sample_inds] + s.start for s, v in zip(border_slices, valid_inds)]
 
     # res = [np.stack([data[r[0] - patch_size[0] // 2:r[0] + patch_size[0] - patch_size[0] // 2,
     #                  r[1] - patch_size[1] // 2:r[1] + patch_size[1] - patch_size[1] // 2,
@@ -290,6 +291,8 @@ def create_patches(
     if len(transforms) == 0:
         transforms.append(Transform.identity())
 
+    if normalization is None:
+        normalization = lambda patches_x, patches_y, x, y, mask, channel: (patches_x, patches_y)
 
     image_pairs, n_raw_images = raw_data.generator(), raw_data.size
     tf = Transform(*zip(*transforms)) # convert list of Transforms into Transform of lists
@@ -325,7 +328,7 @@ def create_patches(
     X = np.empty((n_patches,)+tuple(patch_size),dtype=np.float32)
     Y = np.empty_like(X)
 
-    for i, (x,y,_axes,mask) in tqdm(enumerate(image_pairs),total=n_images):
+    for i, (x,y,_axes,mask) in tqdm(enumerate(image_pairs),total=n_images,disable=(not verbose)):
         if i >= n_images:
             warnings.warn('more raw images (or transformations thereof) than expected, skipping excess images.')
             break
@@ -369,7 +372,7 @@ def create_patches_reduced_target(
         n_patches_per_image,
         reduction_axes,
         target_axes = None, # TODO: this should rather be part of RawData and also exposed to transforms
-        **kwargs,
+        **kwargs
     ):
     """Create normalized training data to be used for neural network training.
 
@@ -409,7 +412,13 @@ def create_patches_reduced_target(
     save_file = kwargs.pop('save_file',None)
 
     if any(s is None for s in patch_size):
-        tf = Transform(*zip(*transforms))
+        patch_axes = kwargs.get('patch_axes')
+        if patch_axes is not None:
+            _transforms = list(transforms)
+            _transforms.append(permute_axes(patch_axes))
+        else:
+            _transforms = transforms
+        tf = Transform(*zip(*_transforms))
         image_pairs = compose(*tf.generator)(raw_data.generator())
         x,y,axes,mask = next(image_pairs) # get the first entry from the generator
         patch_size = list(patch_size)
@@ -449,8 +458,12 @@ def create_patches_reduced_target(
 
 # Misc
 
-def shuffle_inplace(*arrs):
-    rng = np.random.RandomState()
+def shuffle_inplace(*arrs,**kwargs):
+    seed = kwargs.pop('seed', None)
+    if seed is None:
+        rng = np.random
+    else:
+        rng = np.random.RandomState(seed=seed)
     state = rng.get_state()
     for a in arrs:
         rng.set_state(state)

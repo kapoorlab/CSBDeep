@@ -33,8 +33,20 @@ def plot_history(history,*keys,**kwargs):
 
 
 def plot_some(*arr, **kwargs):
-    """Quickly plot multiple images at once."""
+    """Quickly plot multiple images at once.
 
+    each arr has to be a list of 2D or 3D images
+
+    Example
+    =======
+
+    x = np.ones((200,200))
+    plot_some([x],[x])
+
+    x = np.ones((5,200,200))
+    plot_some(x,x,x)
+
+    """
     title_list = kwargs.pop('title_list',None)
     pmin = kwargs.pop('pmin',0)
     pmax = kwargs.pop('pmax',100)
@@ -56,16 +68,21 @@ def _plot_some(arr, title_list=None, pmin=0, pmax=100, cmap='magma', **imshow_kw
     :param pmax:
     :param imshow_kwargs:
     :return:
+
     """
     import matplotlib.pyplot as plt
-
     imshow_kwargs['cmap'] = cmap
 
+    def make_acceptable(a):
+        return np.asarray(a)
     def color_image(a):
-        return np.stack(map(to_color,a)) if 1<a.shape[-1]<=3 else np.squeeze(a)
+        return np.stack(map(to_color,a)) if 1 < a.shape[-1] <= 3 else a
     def max_project(a):
-        return np.max(a,axis=1) if (a.ndim==4 and not 1<=a.shape[-1]<=3) else a
+        ndim_allowed = 2 + int(1 <= a.shape[-1] <= 3)
+        proj_axis = tuple(range(1, 1 + max(0, a[0].ndim - ndim_allowed)))
+        return np.max(a, axis=proj_axis)
 
+    arr = map(make_acceptable,arr)
     arr = map(color_image,arr)
     arr = map(max_project,arr)
     arr = list(arr)

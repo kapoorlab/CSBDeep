@@ -89,37 +89,35 @@ class IsotropicCARE(CARE):
         x_scaled = scale_z(x,factor)
 
         # resize: make (x,y,z) image dimensions divisible by power of 2 to allow downsampling steps in unet
-        div_n = 2 ** self.config.unet_n_depth
-        x_scaled = resizer.before(x_scaled,div_n,exclude=channel)
+        x_scaled = resizer.before(x_scaled, axes_tmp, self._axes_div_by(axes_tmp))
 
-        # move channel to the end
+        # move channel to the end (axes_predict semantics)
         x_scaled = np.moveaxis(x_scaled, channel, -1)
+        axes_predict = 'S' + axes_tmp[2:] + 'C'
         channel = -1
 
         # u1: first rotation and prediction
         x_rot1   = self._rotate(x_scaled, axis=1, copy=False)
-        u_rot1   = predict_direct(self.keras_model, x_rot1, channel_in=channel, channel_out=channel, single_sample=False,
-                                  batch_size=batch_size, verbose=0)
+        u_rot1   = predict_direct(self.keras_model, x_rot1, axes_predict, batch_size=batch_size, verbose=0)
         u1       = self._rotate(u_rot1, -1, axis=1, copy=False)
 
         # u2: second rotation and prediction
         x_rot2   = self._rotate(self._rotate(x_scaled, axis=2, copy=False), axis=0, copy=False)
-        u_rot2   = predict_direct(self.keras_model, x_rot2, channel_in=channel, channel_out=channel, single_sample=False,
-                                  batch_size=batch_size, verbose=0)
+        u_rot2   = predict_direct(self.keras_model, x_rot2, axes_predict, batch_size=batch_size, verbose=0)
         u2       = self._rotate(self._rotate(u_rot2, -1, axis=0, copy=False), -1, axis=2, copy=False)
 
         n_channel_predicted = self.config.n_channel_out * (2 if self.config.probabilistic else 1)
         u_rot1.shape[channel] == n_channel_predicted or _raise(ValueError())
         u_rot2.shape[channel] == n_channel_predicted or _raise(ValueError())
 
-        # move channel back to the front
+        # move channel back to the front (axes_tmp semantics)
         u1 = np.moveaxis(u1, channel, 0)
         u2 = np.moveaxis(u2, channel, 0)
         channel = 0
 
         # resize after prediction
-        u1 = resizer.after(u1,exclude=channel)
-        u2 = resizer.after(u2,exclude=channel)
+        u1 = resizer.after(u1, axes_tmp)
+        u2 = resizer.after(u2, axes_tmp)
 
         # combine u1 & u2
         mean1, scale1 = self._mean_and_scale_from_prediction(u1,axis=channel)
@@ -131,7 +129,7 @@ class IsotropicCARE(CARE):
             scale = np.maximum(scale1,scale2)
 
         if normalizer.do_after and self.config.n_channel_in==self.config.n_channel_out:
-            mean, scale = normalizer.after(mean, scale)
+            mean, scale = normalizer.after(mean, scale, axes_tmp)
 
         mean, scale = _permute_axes(mean,undo=True), _permute_axes(scale,undo=True)
 
